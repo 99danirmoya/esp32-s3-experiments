@@ -12,6 +12,7 @@
 */
 
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include "time.h"
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -41,9 +42,20 @@
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 Adafruit_NeoPixel pixels(NUM_PIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
+// Multi-network credentials
+const int NUM_NETWORKS = 3;
+const char* WIFI_SSIDS[NUM_NETWORKS] = {
+    "Pixel_OF13",
+    "WiFi-Rguez-Moya",
+    "MOYA-LAPTOP 3439"
+};
+const char* WIFI_PASSWORDS[NUM_NETWORKS] = {
+    "mynameisjeff",
+    "Trece131313!",
+    "00v44Q2["
+};
+
 // Network and Time configuration
-const char* ssid     = "MOYA-LAPTOP 3439";
-const char* password = "00v44Q2[";
 const char* ntpServer = "pool.ntp.org";
 const long  gmtOffset_sec = 3600;
 const int   daylightOffset_sec = 3600;
@@ -52,6 +64,7 @@ const int   daylightOffset_sec = 3600;
 volatile bool showAnalogClock = true;
 struct tm timeinfo;
 unsigned long lastSecondTick = 0;
+bool timeSynced = false; // Flag to check if we successfully synced time
 
 // Function Prototypes
 void updateOledDisplay();
@@ -90,31 +103,66 @@ void setup(){
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), button_ISR, FALLING);
 
   // Connect to Wi-Fi
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi connected.");
+  // --- Multi-Network Connection Logic ---
+  bool wifi_connected = false;
+  Serial.println("Attempting to connect to available Wi-Fi networks...");
+  WiFi.mode(WIFI_STA); // Set to station mode
 
-  // Init and get time
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  if(!getLocalTime(&timeinfo)){
-    Serial.println("Failed to obtain initial time");
-    return;
+  esp_wifi_set_max_tx_power(40);
+
+  for (int i = 0; i < NUM_NETWORKS; i++) {
+    const char* current_ssid = WIFI_SSIDS[i];
+    const char* current_password = WIFI_PASSWORDS[i];
+
+    Serial.print("Trying SSID: ");
+    Serial.println(current_ssid);
+
+    WiFi.begin(current_ssid, current_password);
+
+    int attempts = 0;
+    // Wait up to 10 seconds (20 attempts * 500ms) for connection
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("\nSuccessfully connected to: ");
+      Serial.println(current_ssid);
+      wifi_connected = true;
+      break; // Exit the for loop upon success
+    } else {
+      Serial.println("\nFailed to connect to this network.");
+      // Stop trying this network and prepare for the next
+      WiFi.disconnect();
+      delay(100); // Small pause before next attempt
+    }
   }
-  Serial.println("Initial time obtained.");
-  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+
+  if (!wifi_connected) {
+    Serial.println("FATAL: Could not connect to any specified Wi-Fi network. Clock time will be inaccurate.");
+  }
+
+  // Init and get time (only proceed if connected)
+  if (wifi_connected) {
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    if(!getLocalTime(&timeinfo)){
+      Serial.println("Failed to obtain initial time");
+    } else {
+      Serial.println("Initial time obtained.");
+      Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+      timeSynced = true;
+    }
+
+    // Disconnect WiFi to save power (as per original logic)
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+  }
 
   // Initialize timing variable
   lastSecondTick = millis();
   updateOledDisplay(); // Initial display draw
-
-  // Disconnect WiFi
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
 }
 
 void loop(){
