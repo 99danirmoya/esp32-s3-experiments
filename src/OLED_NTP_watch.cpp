@@ -9,6 +9,12 @@
  * - Drive a NeoPixel on GPIO 48 as a smooth green-to-red 60-second color timer.
  * - Set NeoPixel brightness to 10/255.
  * - Draw analog tick marks correctly on the rectangular border, which fills the entire screen.
+ *
+ * --- MODIFIED TO ADD ALARM FUNCTIONALITY ---
+ * - Uses std::vector for a dynamic list of alarms.
+ * - Alarms trigger on the o'clock hour.
+ * - Plays a non-blocking, multi-frequency beep pattern on BUZZER_PIN 7 using LEDC.
+ * - Button on PIN 0 disables the *current* alarm when active, otherwise toggles clock.
  */
 
 #include <WiFi.h>
@@ -19,6 +25,7 @@
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_NeoPixel.h>
 #include <math.h> // For sin, cos, and PI
+#include <vector> // --- NEW: For a dynamic array of alarms ---
 
 // OLED parameters
 #define SCREEN_WIDTH 128
@@ -34,6 +41,18 @@
 // NeoPixel parameters
 #define NEOPIXEL_PIN 48
 #define NUM_PIXELS   1
+
+// --- NEW: Alarm and Buzzer Definitions ---
+#define BUZZER_PIN 7
+const int LEDC_CHANNEL = 0;      // ESP32 LEDC channel 0 for buzzer
+const int LEDC_RESOLUTION = 8;     // 8-bit resolution
+const int LEDC_BASE_FREQ = 5000;   // Base frequency for LEDC setup
+const int MIN_ALARM_FREQ = 200;    // Starting (low) beep pitch
+const int MAX_ALARM_FREQ = 1500;   // Max (moderate-high) beep pitch
+const int TOTAL_ALARM_DURATION_MS = 60000; // 60 seconds in milliseconds
+const int ALARM_CYCLE_MS = 2500;           // 0.5+0.5+0.5+1.0 seconds = 2500 ms
+const int TOTAL_FREQ_STEPS = TOTAL_ALARM_DURATION_MS / ALARM_CYCLE_MS; // 60000 / 2500 = 24
+const int FREQ_INCREMENT = 55;             // (1500 - 200) / 24 steps = 54.17. We use 55 Hz.
 
 // Object Instantiation
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
@@ -63,10 +82,28 @@ struct tm timeinfo;
 unsigned long lastSecondTick = 0;
 bool timeSynced = false; // Flag to check if we successfully synced time
 
-// --- Custom 7-Segment Drawing Variables and Functions ---
+// --- MODIFIED: Alarm System Globals ---
+struct Alarm {
+  int hour;   // 0-23
+  int minute; // *** NEW: 0-59 ***
+  bool enabled;
+};
+std::vector<Alarm> alarms; // Dynamic array (vector) for alarms
 
-// Define segment truth table for each digit (a-g)
-// Segments are indexed 0 (a) to 6 (g)
+volatile bool isAlarmActive = false;      // True if alarm is currently sounding
+volatile bool alarmDisableRequest = false; // Flag set by ISR to disable an alarm
+int activeAlarmHour = -1;                 // Hour of the ringing alarm
+int activeAlarmMinute = -1;               // *** NEW: Minute of the ringing alarm ***
+unsigned long alarmStartTime = 0;         // millis() when the alarm started (for 1-min timeout)
+unsigned long lastAlarmBeepTime = 0;      // millis() for the alarm beep state machine
+int alarmState = 0;                       // State machine for beep pattern (0-4)
+int currentFrequency = MIN_ALARM_FREQ;    // Current beep pitch
+
+
+// --- Custom 7-Segment Drawing Variables and Functions ---
+// ... (All your existing 7-segment functions: digit_array, render_digit, render_colon, render_time_string) ...
+// [No changes to this section]
+
 static const int digit_array[10][7] = {
     {1, 1, 1, 1, 1, 1, 0},  // 0
     {0, 1, 1, 0, 0, 0, 0},  // 1
@@ -79,136 +116,72 @@ static const int digit_array[10][7] = {
     {1, 1, 1, 1, 1, 1, 1},  // 8
     {1, 1, 1, 0, 0, 1, 1}   // 9
 };
+const int DIGIT_H = 20;
+const int SEG_THICKNESS = 2;
+const int SEG_LEN_H = 6;
+const int SEG_LEN_V = 7;
+const int DIGIT_W_RENDER = SEG_LEN_H + 2 * SEG_THICKNESS;
+const int COLON_WIDTH = 4;
+const int CHAR_SPACING = 0;
+const int SEG_ROUNDNESS = 1;
+const int DIGIT_ADVANCE = DIGIT_W_RENDER + 2;
+const int COLON_ADVANCE = 4;
 
-// --- Segment Dimensions (ADJUSTED FOR 128x64 SCREEN SIZE) ---
-const int DIGIT_H = 20;        // Total height of one digit bounding box (Reduced from 30)
-const int SEG_THICKNESS = 2;   // Thickness of the segment line (Kept at 2)
-const int SEG_LEN_H = 6;       // Length of horizontal segments (A, D, G) (Reduced from 18)
-const int SEG_LEN_V = 7;       // Length of vertical segments (B, C, E, F) (Reduced from 28)
-const int DIGIT_W_RENDER = SEG_LEN_H + 2 * SEG_THICKNESS; // Total rendered width of digit (10)
-const int COLON_WIDTH = 4;     // Width of the colon separator (Kept at 2)
-const int CHAR_SPACING = 0;    // Space between elements (digits/colon) (Kept at 2)
-const int SEG_ROUNDNESS = 1;   // Roundness for fillRoundRect (Kept at 1)
-
-// Calculated Advances
-const int DIGIT_ADVANCE = DIGIT_W_RENDER + 2; // 10 + 2 = 12
-const int COLON_ADVANCE = 4;    // 2 + 2 = 4
-
-/**
- * Draws a single 7-segment digit (0-9) at a given position.
- */
 void render_digit(int16_t pos_x, int16_t pos_y, uint8_t digit, uint8_t color) {
     if (digit > 9) return;
-
     for (uint8_t i = 0; i < 7; i++) {
         bool seg_on = digit_array[digit][i];
         if (seg_on) {
-            // NOTE: The coordinates are complex because they rely on multiple constants.
             switch (i) {
-                // Segment A (Top horizontal) - Starts at pos_x + thickness
                 case 0: display.fillRoundRect(pos_x + SEG_THICKNESS, pos_y, SEG_LEN_H, SEG_THICKNESS, SEG_ROUNDNESS, color); break;
-                
-                // Segment B (Top right vertical) - Starts after the horizontal segment ends
                 case 1: display.fillRoundRect(pos_x + SEG_THICKNESS + SEG_LEN_H, pos_y + SEG_THICKNESS, SEG_THICKNESS, SEG_LEN_V, SEG_ROUNDNESS, color); break;
-                
-                // Segment C (Bottom right vertical) - Starts after G segment
                 case 2: display.fillRoundRect(pos_x + SEG_THICKNESS + SEG_LEN_H, pos_y + 2*SEG_THICKNESS + SEG_LEN_V, SEG_THICKNESS, SEG_LEN_V, SEG_ROUNDNESS, color); break;
-                
-                // Segment D (Bottom horizontal) - Starts at pos_x + thickness
                 case 3: display.fillRoundRect(pos_x + SEG_THICKNESS, pos_y + DIGIT_H - SEG_THICKNESS, SEG_LEN_H, SEG_THICKNESS, SEG_ROUNDNESS, color); break;
-                
-                // Segment E (Bottom left vertical) - Starts at pos_x
                 case 4: display.fillRoundRect(pos_x, pos_y + 2*SEG_THICKNESS + SEG_LEN_V, SEG_THICKNESS, SEG_LEN_V, SEG_ROUNDNESS, color); break;
-                
-                // Segment F (Top left vertical) - Starts at pos_x
                 case 5: display.fillRoundRect(pos_x, pos_y + SEG_THICKNESS, SEG_THICKNESS, SEG_LEN_V, SEG_ROUNDNESS, color); break;
-                
-                // Segment G (Middle horizontal) - Separates top and bottom halves
                 case 6: display.fillRoundRect(pos_x + SEG_THICKNESS, pos_y + SEG_THICKNESS + SEG_LEN_V, SEG_LEN_H, SEG_THICKNESS, SEG_ROUNDNESS, color); break;
             }
         }
     }
 }
 
-/**
- * Draws a colon separator (two dots).
- * [FIXED: Using fillRect for 2x2 dots]
- */
 void render_colon(int16_t pos_x, int16_t pos_y, uint8_t color) {
-    int dot_size = SEG_THICKNESS; // 2 pixels
-    
-    // Use the full advance distance (4 pixels) as the virtual width for centering.
+    int dot_size = SEG_THICKNESS;
     const int VIRTUAL_COLON_WIDTH = 4; 
-
-    // Vertical Positioning based on DIGIT_H = 20
-    int dot_spacing = DIGIT_H / 4; // 5 pixels
-    int top_dot_y = pos_y + dot_spacing; // Starts at Y+5
-    int bottom_dot_y = pos_y + DIGIT_H - dot_spacing - dot_size; // Starts at Y+13
-    
-    // Horizontal Positioning: Center the 2px dot within the 4px VIRTUAL_COLON_WIDTH.
-    // (4 - 2) / 2 = 1. This gives a 1-pixel buffer on either side of the dot.
+    int dot_spacing = DIGIT_H / 4;
+    int top_dot_y = pos_y + dot_spacing;
+    int bottom_dot_y = pos_y + DIGIT_H - dot_spacing - dot_size;
     int dot_x = pos_x + (VIRTUAL_COLON_WIDTH - dot_size) / 2;
-
-    // Draw the two dots (now centered horizontally)
-    // Using fillRect as it's more reliable for 2x2 squares than fillRoundRect
     display.fillRect(dot_x, top_dot_y, dot_size, dot_size, color);
     display.fillRect(dot_x, bottom_dot_y, dot_size, dot_size, color);
 }
 
-/**
- * Renders the full HH:MM:SS time string, centered on the display.
- * [FIXED: Corrected total_width calculation for perfect centering]
- */
 void render_time_string(int hour, int minute, int second, uint8_t color) {
-    
-    // --- Correct total_width calculation ---
-    // The total width is the sum of advances for the first 7 elements, 
-    // PLUS the width of the final (8th) element.
-    // (5 * DIGIT_ADVANCE) + (2 * COLON_ADVANCE) + (1 * DIGIT_W_RENDER)
-    // (5 * 12) + (2 * 4) + (1 * 10) = 60 + 8 + 10 = 78 pixels.
     const int total_width = (5 * DIGIT_ADVANCE) + (2 * COLON_ADVANCE) + DIGIT_W_RENDER;
-    
-    // Calculate the starting X position for horizontal centering (128 - 78) / 2 = 25
     int16_t x_cursor = (SCREEN_WIDTH - total_width) / 2;
-    // Calculate the starting Y position for vertical centering (64 - 20) / 2 = 22
     int16_t y_pos = (SCREEN_HEIGHT - DIGIT_H) / 2;
 
-    // --- RENDER HOURS (HH) ---
-    // 1. Hour (Tens)
     render_digit(x_cursor, y_pos, hour / 10, color);
-    x_cursor += DIGIT_ADVANCE; // Advance by 12
-
-    // 2. Hour (Units)
+    x_cursor += DIGIT_ADVANCE;
     render_digit(x_cursor, y_pos, hour % 10, color);
-    x_cursor += DIGIT_ADVANCE; // Advance by 12
+    x_cursor += DIGIT_ADVANCE;
 
-    // 3. Colon 1 (HH:MM Separator - Blinking)
     if (second % 2 == 0) {
         render_colon(x_cursor, y_pos, color);
     }
-    x_cursor += COLON_ADVANCE; // Advance by 4
+    x_cursor += COLON_ADVANCE;
 
-    // --- RENDER MINUTES (MM) ---
-    // 4. Minute (Tens)
     render_digit(x_cursor, y_pos, minute / 10, color);
-    x_cursor += DIGIT_ADVANCE; // Advance by 12
-
-    // 5. Minute (Units)
+    x_cursor += DIGIT_ADVANCE;
     render_digit(x_cursor, y_pos, minute % 10, color);
-    x_cursor += DIGIT_ADVANCE; // Advance by 12
+    x_cursor += DIGIT_ADVANCE;
 
-    // 6. Colon 2 (MM:SS Separator - Static)
     render_colon(x_cursor, y_pos, color);
-    x_cursor += COLON_ADVANCE; // Advance by 4
+    x_cursor += COLON_ADVANCE;
 
-    // --- RENDER SECONDS (SS) ---
-    // 7. Second (Tens)
     render_digit(x_cursor, y_pos, second / 10, color);
-    x_cursor += DIGIT_ADVANCE; // Advance by 12
-
-    // 8. Second (Units)
+    x_cursor += DIGIT_ADVANCE;
     render_digit(x_cursor, y_pos, second % 10, color);
-    // No need to advance cursor after the last digit
 }
 
 // --- End of Custom 7-Segment Drawing Functions ---
@@ -221,10 +194,43 @@ void drawAnalogClock(int hour, int minute, int second);
 void drawDigitalClock(int hour, int minute, int second);
 void getRectPerimeterPoint(float distance, float x, float y, float w, float h, float& px, float& py);
 
+// --- NEW: Alarm Function Prototypes ---
+void setupAlarms();
+void checkAlarmTrigger();
+void handleAlarmSound();
+void checkAlarmDisableRequest();
 
-// Interrupt Service Routine for button press
+
+// --- MODIFIED: Interrupt Service Routine for button press ---
+/**
+ * @brief ISR for the button on GPIO 0.
+ * If an alarm is active, it sets a flag to disable that alarm.
+ * If no alarm is active, it toggles the clock face.
+ */
 void IRAM_ATTR button_ISR() {
-  showAnalogClock = !showAnalogClock;
+  if (isAlarmActive) {
+    // Don't do heavy work in ISR! Just set a flag.
+    alarmDisableRequest = true;
+  } else {
+    // Original functionality
+    showAnalogClock = !showAnalogClock;
+  }
+}
+
+// --- NEW: Function to populate the alarms vector ---
+/**
+ * @brief Adds alarms to the global vector.
+ * Alarms are defined by hour (0-23) and enabled status.
+ */
+void setupAlarms() {
+// --- NEW Format: { hour, minute, enabled } ---
+  alarms.push_back({23, 20, true});   // Add an alarm for 8:30 AM
+  alarms.push_back({23, 22, true});   // Add an alarm for 2:05 PM
+  alarms.push_back({6, 0, true});   // Add an alarm for 10:00 PM (on the hour)
+
+  Serial.print("Initialized ");
+  Serial.print(alarms.size());
+  Serial.println(" alarms.");
 }
 
 void setup(){
@@ -251,41 +257,42 @@ void setup(){
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), button_ISR, FALLING);
 
+  // --- NEW: Setup Buzzer Pin and LEDC Channel ---
+  pinMode(BUZZER_PIN, OUTPUT);
+  ledcSetup(LEDC_CHANNEL, LEDC_BASE_FREQ, LEDC_RESOLUTION);
+  ledcAttachPin(BUZZER_PIN, LEDC_CHANNEL);
+  ledcWriteTone(LEDC_CHANNEL, 0); // Ensure buzzer is off
+  
+  // --- NEW: Load the alarms into memory ---
+  setupAlarms();
+
   // Connect to Wi-Fi
-  // --- Multi-Network Connection Logic ---
+  // ... (Existing multi-network connection logic) ...
   bool wifi_connected = false;
   Serial.println("Attempting to connect to available Wi-Fi networks...");
-  WiFi.mode(WIFI_STA); // Set to station mode
-
+  WiFi.mode(WIFI_STA);
   esp_wifi_set_max_tx_power(40);
-
   for (int i = 0; i < NUM_NETWORKS; i++) {
     const char* current_ssid = WIFI_SSIDS[i];
     const char* current_password = WIFI_PASSWORDS[i];
-
     Serial.print("Trying SSID: ");
     Serial.println(current_ssid);
-
     WiFi.begin(current_ssid, current_password);
-
     int attempts = 0;
-    // Wait up to 10 seconds (20 attempts * 500ms) for connection
     while (WiFi.status() != WL_CONNECTED && attempts < 20) {
       delay(500);
       Serial.print(".");
       attempts++;
     }
-
     if (WiFi.status() == WL_CONNECTED) {
       Serial.print("\nSuccessfully connected to: ");
       Serial.println(current_ssid);
       wifi_connected = true;
-      break; // Exit the for loop upon success
+      break;
     } else {
       Serial.println("\nFailed to connect to this network.");
-      // Stop trying this network and prepare for the next
       WiFi.disconnect();
-      delay(100); // Small pause before next attempt
+      delay(100);
     }
   }
 
@@ -303,8 +310,7 @@ void setup(){
       Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
       timeSynced = true;
     }
-
-    // Disconnect WiFi to save power (as per original logic)
+    // Disconnect WiFi to save power
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
   }
@@ -314,53 +320,216 @@ void setup(){
   updateOledDisplay(); // Initial display draw
 }
 
+/**
+ * @brief Main application loop.
+ */
 void loop(){
   unsigned long currentMillis = millis();
 
-  // --- Task 1: Update Time and OLED Display (once per second) ---
+  // --- Task 1: Check for user alarm disable request (from ISR) ---
+  checkAlarmDisableRequest();
+
+  // --- Task 2: Handle active alarm sound generation (non-blocking) ---
+  handleAlarmSound();
+
+  // --- Task 3: Update Time, OLED, and Check for Alarm Trigger (once per second) ---
   if (currentMillis - lastSecondTick >= 1000) {
+    bool timeUpdated = false;
+    
     if(!getLocalTime(&timeinfo)){
       // Handle time manually if NTP fails after initial sync
       if(timeSynced) {
         timeinfo.tm_sec++;
         if (timeinfo.tm_sec >= 60) { timeinfo.tm_sec = 0; timeinfo.tm_min++; }
         if (timeinfo.tm_min >= 60) { timeinfo.tm_min = 0; timeinfo.tm_hour++; }
-        if (timeinfo.tm_hour >= 24) { timeinfo.tm_hour = 0; /* simplified date increment */ }
+        if (timeinfo.tm_hour >= 24) { timeinfo.tm_hour = 0; }
         
         updateOledDisplay();
+        timeUpdated = true;
       } else {
          Serial.println("Failed to obtain time");
       }
     } else {
       updateOledDisplay();
+      timeUpdated = true;
     }
+
+    // --- NEW ALARM TRIGGER LOGIC ---
+    // Only check for a new alarm if time was successfully updated
+    // and an alarm is not already active.
+    if (timeUpdated && !isAlarmActive) {
+      checkAlarmTrigger();
+    }
+    // --- END NEW LOGIC ---
+
     lastSecondTick += 1000;
   }
 
-  // --- Task 2: Update NeoPixel Color (as fast as possible for smoothness) ---
+  // --- Task 4: Update NeoPixel Color (as fast as possible for smoothness) ---
   updateNeoPixelColor();
 }
 
+// --- NEW: Function to check and handle alarm disable request ---
+/**
+ * @brief Checks if the ISR has requested an alarm disable.
+ * If so, it stops the sound and permanently disables the
+ * alarm that was ringing.
+ */
+void checkAlarmDisableRequest() {
+  if (alarmDisableRequest) {
+    alarmDisableRequest = false; // Clear the flag
+    
+    if (isAlarmActive) {
+      Serial.print("Disabling alarm for: ");
+      Serial.printf("%02d:%02d\n", activeAlarmHour, activeAlarmMinute);
+      
+      isAlarmActive = false; // Stop the sound
+      ledcWriteTone(LEDC_CHANNEL, 0); // Explicitly stop sound
+
+      // --- MODIFIED: Find and disable the exact H:M match ---
+      for (auto& alarm : alarms) {
+        if (alarm.hour == activeAlarmHour && alarm.minute == activeAlarmMinute) {
+          alarm.enabled = false;
+          Serial.println("Alarm disabled.");
+          break;
+        }
+      }
+      activeAlarmHour = -1;
+      activeAlarmMinute = -1; // Reset minute tracker
+    }
+  }
+}
+
+// --- NEW: Function to check if an alarm should start ---
+/**
+ * @brief Checks if the current time (at the top of the hour)
+ * matches any enabled alarm.
+ */
+void checkAlarmTrigger() {
+  // Check only at the top of the minute (00 seconds) to prevent re-triggering
+  if (timeinfo.tm_sec == 0) {
+    /*
+    // Debug: Uncomment this to see the check every minute
+    Serial.print("Checking for alarm at: ");
+    Serial.printf("%02d:%02d\n", timeinfo.tm_hour, timeinfo.tm_min);
+    */
+
+    for (const auto& alarm : alarms) {
+      // --- MODIFIED: Check for hour, minute, and enabled status ---
+      if (alarm.hour == timeinfo.tm_hour && 
+          alarm.minute == timeinfo.tm_min && 
+          alarm.enabled) {
+            
+        Serial.printf("!!! ALARM TRIGGERED for %02d:%02d !!!\n", alarm.hour, alarm.minute);
+        isAlarmActive = true;
+        activeAlarmHour = alarm.hour;   // Store which alarm is ringing
+        activeAlarmMinute = alarm.minute; // Store which alarm is ringing
+        alarmStartTime = millis();        // For 1-min timeout
+        alarmState = 0;                   // Reset state machine
+        currentFrequency = MIN_ALARM_FREQ; // Reset frequency
+        lastAlarmBeepTime = millis();     // Start immediately
+        break; // Only trigger one alarm
+      }
+    }
+  }
+}
+
+// --- NEW: Function to generate the alarm sound pattern ---
+
+/**
+ * @brief Non-blocking state machine to play the alarm sound.
+ * Must be called continuously from the main loop.
+ */
+void handleAlarmSound() {
+  // If no alarm is active, do nothing.
+  if (!isAlarmActive) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+// Check for alarm timeout (1 minute)
+  if (now - alarmStartTime > 60000) {
+    Serial.println("Alarm finished (1 min timeout).");
+    isAlarmActive = false;
+    activeAlarmHour = -1;
+    activeAlarmMinute = -1; // --- ADD THIS LINE ---
+    ledcWriteTone(LEDC_CHANNEL, 0); // Stop sound
+    return;
+  }
+
+  // State Machine for Beep Pattern:
+  // 0: Start Beep 1
+  // 1: In Beep 1 (wait 0.5s)
+  // 2: In Silence 1 (wait 0.5s)
+  // 3: In Beep 2 (wait 0.5s)
+  // 4: In Silence 2 (wait 1.0s) -> loop to 0
+  
+  switch (alarmState) {
+    case 0: // Start Beep 1
+      ledcWriteTone(LEDC_CHANNEL, currentFrequency);
+      lastAlarmBeepTime = now;
+      alarmState = 1;
+      break;
+    
+    case 1: // In Beep 1, wait for 0.5s
+      if (now - lastAlarmBeepTime >= 500) {
+        ledcWriteTone(LEDC_CHANNEL, 0); // Start Silence 1
+        lastAlarmBeepTime = now;
+        alarmState = 2;
+      }
+      break;
+
+    case 2: // In Silence 1, wait for 0.5s
+      if (now - lastAlarmBeepTime >= 500) {
+        ledcWriteTone(LEDC_CHANNEL, currentFrequency); // Start Beep 2
+        lastAlarmBeepTime = now;
+        alarmState = 3;
+      }
+      break;
+
+    case 3: // In Beep 2, wait for 0.5s
+      if (now - lastAlarmBeepTime >= 500) {
+        ledcWriteTone(LEDC_CHANNEL, 0); // Start Silence 2 (long)
+        lastAlarmBeepTime = now;
+        alarmState = 4;
+        
+        // Increase frequency for the *next* pair
+        currentFrequency += FREQ_INCREMENT;
+        
+        // --- MODIFIED: Ensure we don't exceed the max pitch, but DO NOT RESET. ---
+        if (currentFrequency > MAX_ALARM_FREQ) {
+            currentFrequency = MAX_ALARM_FREQ; // Cap it at the maximum pitch
+        }
+      }
+      break;
+
+    case 4: // In Silence 2, wait for 1.0s
+      if (now - lastAlarmBeepTime >= 1000) {
+        alarmState = 0; // Loop back to Start Beep 1
+      }
+      break;
+  }
+}
+
+
 void updateNeoPixelColor() {
-  // Keep NeoPixel off if time isn't synced yet
+  // ... (Existing NeoPixel logic - no changes) ...
   if (!timeSynced) {
     pixels.setPixelColor(0, pixels.Color(0, 0, 0));
     pixels.show();
     return;
   }
-  
   unsigned long millisIntoMinute = (timeinfo.tm_sec * 1000) + (millis() - lastSecondTick);
   millisIntoMinute = constrain(millisIntoMinute, 0, 59999);
-
-  // Smooth transition from Green (0ms) to Red (60000ms)
   uint8_t red   = map(millisIntoMinute, 0, 59999, 0, 255);
   uint8_t green = map(millisIntoMinute, 0, 59999, 255, 0);
-
   pixels.setPixelColor(0, pixels.Color(red, green, 0));
   pixels.show();
 }
 
 void updateOledDisplay() {
+  // ... (Existing OLED update logic - no changes) ...
   Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
   if (showAnalogClock) {
     drawAnalogClock(timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
@@ -369,119 +538,80 @@ void updateOledDisplay() {
   }
 }
 
-/**
- * Draws the digital clock face using custom 7-segment drawing primitives.
- */
 void drawDigitalClock(int hour, int minute, int second) {
+  // ... (Existing digital clock logic - no changes) ...
   display.clearDisplay();
-  
   render_time_string(hour, minute, second, SSD1306_WHITE);
-
   display.display();
 }
 
-// Helper function to find a point on the perimeter of a rectangle
 void getRectPerimeterPoint(float distance, float x, float y, float w, float h, float& px, float& py) {
-    // The drawable area is w-1 and h-1
-    float drawn_w = w - 1;
-    float drawn_h = h - 1;
-    float perimeter = 2 * (drawn_w + drawn_h);
-    distance = fmod(distance, perimeter);
-
-    if (distance < drawn_w) { // Top edge (x to x+w-1)
-        px = x + distance;
-        py = y;
-    } else if (distance < drawn_w + drawn_h) { // Right edge (y to y+h-1)
-        px = x + drawn_w;
-        py = y + (distance - drawn_w);
-    } else if (distance < 2 * drawn_w + drawn_h) { // Bottom edge (x+w-1 to x)
-        px = x + drawn_w - (distance - (drawn_w + drawn_h));
-        py = y + drawn_h;
-    } else { // Left edge (y+h-1 to y)
-        px = x;
-        py = y + drawn_h - (distance - (2 * drawn_w + drawn_h));
-    }
+  // ... (Existing analog clock helper - no changes) ...
+  float drawn_w = w - 1;
+  float drawn_h = h - 1;
+  float perimeter = 2 * (drawn_w + drawn_h);
+  distance = fmod(distance, perimeter);
+  if (distance < drawn_w) {
+    px = x + distance;
+    py = y;
+  } else if (distance < drawn_w + drawn_h) {
+    px = x + drawn_w;
+    py = y + (distance - drawn_w);
+  } else if (distance < 2 * drawn_w + drawn_h) {
+    px = x + drawn_w - (distance - (drawn_w + drawn_h));
+    py = y + drawn_h;
+  } else {
+    px = x;
+    py = y + drawn_h - (distance - (2 * drawn_w + drawn_h));
+  }
 }
 
-// Function to draw the rectangular analog clock
 void drawAnalogClock(int hour, int minute, int second) {
+  // ... (Existing analog clock drawing logic - no changes) ...
   display.clearDisplay();
   display.setFont(NULL);
-
-  // Make the clock face fill the entire screen
   int clockX = 0;
   int clockY = 0;
   int clockWidth = SCREEN_WIDTH;
   int clockHeight = SCREEN_HEIGHT;
-  // Draw the delimiting rectangle
   display.drawRect(clockX, clockY, clockWidth, clockHeight, SSD1306_WHITE);
-  
-
   int centerX = clockX + clockWidth / 2;
   int centerY = clockY + clockHeight / 2;
-  
-  // --- Constants for Tick Spacing ---
-  const int tickLength = 4;      
-  const int TICK_OFFSET = 5;     
-
-  // Draw 12 evenly-spaced hour ticks on the rectangular contour
+  const int tickLength = 4;
+  const int TICK_OFFSET = 5;
   float perimeter = 2.0 * ((clockWidth - 1) + (clockHeight - 1));
   float hour_spacing = perimeter / 12.0;
-  float start_offset = (float)(clockWidth - 1) / 2.0; 
-
+  float start_offset = (float)(clockWidth - 1) / 2.0;
   for (int i = 0; i < 12; i++) {
-      float distance = fmod(start_offset + i * hour_spacing, perimeter);
-      float edgeX, edgeY; 
-      
-      // Step 1: Find the point on the very edge
-      getRectPerimeterPoint(distance, (float)clockX, (float)clockY, (float)clockWidth, (float)clockHeight, edgeX, edgeY);
-
-      // Step 2: Calculate the normalized direction vector (Edge -> Center)
-      float dirX = centerX - edgeX;
-      float dirY = centerY - edgeY;
-      float len = sqrt(dirX * dirX + dirY * dirY);
-      if (len > 0) {
-          dirX /= len; 
-          dirY /= len;
-      }
-      
-      // Step 3: Determine the START point (Offset inward from the edge)
-      float startX = edgeX + dirX * TICK_OFFSET;
-      float startY = edgeY + dirY * TICK_OFFSET;
-
-      // Step 4: Determine the END point (Start point + visible length)
-      float endX = startX + dirX * tickLength;
-      float endY = startY + dirY * tickLength;
-      
-      // Step 5: Draw the line segment
-      display.drawLine((int16_t)startX, (int16_t)startY, (int16_t)endX, (int16_t)endY, SSD1306_WHITE);
+    float distance = fmod(start_offset + i * hour_spacing, perimeter);
+    float edgeX, edgeY;
+    getRectPerimeterPoint(distance, (float)clockX, (float)clockY, (float)clockWidth, (float)clockHeight, edgeX, edgeY);
+    float dirX = centerX - edgeX;
+    float dirY = centerY - edgeY;
+    float len = sqrt(dirX * dirX + dirY * dirY);
+    if (len > 0) {
+      dirX /= len;
+      dirY /= len;
+    }
+    float startX = edgeX + dirX * TICK_OFFSET;
+    float startY = edgeY + dirY * TICK_OFFSET;
+    float endX = startX + dirX * tickLength;
+    float endY = startY + dirY * tickLength;
+    display.drawLine((int16_t)startX, (int16_t)startY, (int16_t)endX, (int16_t)endY, SSD1306_WHITE);
   }
-  // --- End of Tick Drawing Loop ---
-
-  // Calculate angles for hands
   float secAngle = (second * 6.0) * PI / 180.0;
   float minAngle = ((minute * 6.0) + (second * 0.1)) * PI / 180.0;
   float hourAngle = (((hour % 12) * 30.0) + (minute * 0.5)) * PI / 180.0;
-
-  // Draw hands (adjusting hand lengths based on clock size)
   const int maxRadius = clockWidth / 2;
-  
-  // Second Hand (use full radius)
   int secX = centerX + (int)((maxRadius - 2) * sin(secAngle));
   int secY = centerY - (int)((maxRadius - 2) * cos(secAngle));
   display.drawLine(centerX, centerY, secX, secY, SSD1306_WHITE);
-
-  // Minute Hand (shorter)
   int minX = centerX + (int)((maxRadius * 0.75) * sin(minAngle));
   int minY = centerY - (int)((maxRadius * 0.75) * cos(minAngle));
   display.drawLine(centerX, centerY, minX, minY, SSD1306_WHITE);
-
-  // Hour Hand (shortest)
   int hourX = centerX + (int)((maxRadius * 0.5) * sin(hourAngle));
   int hourY = centerY - (int)((maxRadius * 0.5) * cos(hourAngle));
   display.drawLine(centerX, centerY, hourX, hourY, SSD1306_WHITE);
-
-  // Center point
   display.fillCircle(centerX, centerY, 2, SSD1306_WHITE);
   display.display();
 }
